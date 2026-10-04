@@ -444,3 +444,75 @@ To use the storage you need setup it first::
 
    Other parameters are the same as for
    :class:`~aiohttp_session.AbstractStorage` constructor.
+
+SQLite Storage
+--------------
+
+The storage that keeps session data in a SQLite database file and only
+stores the random session identity in the HTTP cookie.  It is useful for
+small deployments that do not want to run a Redis or Memcached service;
+only the Python standard library is required.
+
+Database access is serialized per storage instance with an
+:class:`asyncio.Lock` and executed in a worker thread, so the event loop
+is not blocked.  Every storage instance owns its own
+:class:`sqlite3.Connection`; several instances may share the same file
+(the schema is created with ``IF NOT EXISTS`` inside a locking
+transaction, so concurrent initialization is safe).  Close the
+connection with :meth:`SQLiteStorage.close`, or register it on the
+application with :meth:`SQLiteStorage.install_on_app`.
+
+Expired sessions are removed on demand with
+:meth:`SQLiteStorage.purge_expired_sessions`, which deletes a bounded
+batch per call and never deletes a row that was saved again with a fresh
+expiration time.  No background task is started by the storage.
+
+::
+
+   storage = aiohttp_session.sqlite_storage.SQLiteStorage(
+       "/path/to/sessions.db"
+   )
+   storage.install_on_app(app)
+   aiohttp_session.setup(app, storage)
+
+.. class:: SQLiteStorage(db_path, *, \
+                         cookie_name="AIOHTTP_SESSION", \
+                         domain=None, max_age=None, path='/', \
+                         secure=None, httponly=True, samesite=None, \
+                         key_factory=lambda: secrets.token_urlsafe(32), \
+                         encoder=json.dumps, decoder=json.loads, \
+                         timeout=5.0)
+
+   Create SQLite storage for user session data.
+
+   The class is inherited from :class:`~aiohttp_session.AbstractStorage`.
+
+   *db_path* is a :class:`str` or :class:`pathlib.Path` pointing at the
+   SQLite database file (created on first use).  ``":memory:"`` gives
+   every instance a private in-memory database.
+
+   *timeout* is forwarded to SQLite as the busy timeout in seconds: a
+   concurrent writer waits that long for the file lock instead of
+   failing immediately.
+
+   *key_factory* generates new session identities with
+   :func:`secrets.token_urlsafe` from the cryptographically secure
+   random source.
+
+   Other parameters are the same as for
+   :class:`~aiohttp_session.AbstractStorage` constructor.
+
+   .. method:: purge_expired_sessions(limit=1000)
+
+      A :ref:`coroutine<coroutine>` deleting at most *limit* rows whose
+      absolute expiration time has passed; ``None`` deletes all expired
+      rows.  Returns the number of deleted rows.
+
+   .. method:: close()
+
+      A :ref:`coroutine<coroutine>` closing the owned database
+      connection.  Idempotent; does nothing if never opened.
+
+   .. method:: install_on_app(app)
+
+      Append :meth:`close` to *app*'s ``on_cleanup`` signal.

@@ -84,6 +84,13 @@ Available session storages are:
 
       $ pip install aiohttp_session[aioredis]
 
+* ``aiohttp_session.sqlite_storage.SQLiteStorage(db_path)`` -- stores
+  JSON encoded data in a SQLite database file, keeping only a random
+  identity (generated with :func:`secrets.token_urlsafe`) in the
+  cookie.  Uses the standard library ``sqlite3`` module only, so no
+  extra service or dependency is needed; blocking database calls run in
+  a worker thread.
+
 
 Developing
 ----------
