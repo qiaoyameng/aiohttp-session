@@ -1,5 +1,21 @@
 .. towncrier release notes start
 
+2.13.0 (UNRELEASED)
+===================
+
+* Added ``Session.rotate_identity()`` for rotating the session identity
+  on login or privilege escalation while migrating selected fields (e.g.
+  an anonymous shopping cart).  Server-side storages
+  (``RedisStorage``, ``MemcachedStorage``) perform the create-new /
+  revoke-old transition atomically and leave a tombstone under the old
+  identity, so a late save from a request loaded before rotation raises
+  ``IdentityRevokedError`` instead of resurrecting the revoked identity.
+  The response cookie is updated only after the rotation succeeds; the
+  absolute expiration deadline is preserved by default and may be reset
+  explicitly via ``max_age`` / ``reset_ttl``.  Self-contained cookie
+  storages cannot provide server-side revocation and raise
+  ``IdentityRotationUnsupported``.
+
 2.12.1 (2024-09-25)
 ===================
 

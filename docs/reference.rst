@@ -156,6 +156,67 @@ Session
 
          Never change :py:attr:`identity` of a session which is not new.
 
+   .. method:: rotate_identity(*, fields=None, max_age=None, reset_ttl=False)
+
+      A :ref:`coroutine<coroutine>` that rotates the session identity
+      server-side and migrates selected data to the new identity.
+
+      Call this on login or privilege escalation to defeat `session
+      fixation <https://en.wikipedia.org/wiki/Session_fixation>`_ while
+      keeping state such as an anonymous shopping cart::
+
+         async def login(request):
+             session = await get_session(request)
+             # ... authenticate the user ...
+             session["user"] = user_id
+             await session.rotate_identity(fields=("cart",))
+
+      The storage backend performs the transition **atomically**:
+
+      * a brand-new identity is generated and the migrated data is stored
+        under it;
+      * the old identity is revoked and replaced with a **tombstone**.
+        A request that had already loaded the old identity and tries to
+        save after rotation (a late save / fixation attempt) raises
+        :class:`IdentityRevokedError` instead of resurrecting the old
+        identity;
+      * only after the backend transition succeeds is the session switched
+        to the new identity, so the response cookie is updated
+        exclusively on success.
+
+      *fields* selects the keys migrated to the new identity: ``None``
+      (the default) migrates every key, an iterable (e.g.
+      ``fields=("cart",)``) migrates exactly those keys and raises
+      :class:`KeyError` for a missing key.
+
+      TTL policy:
+
+      * by default the **absolute** expiration deadline is preserved, so
+        rotation never extends the security lifetime.  Backends persist
+        this deadline (the new record and the tombstone expire when the
+        old record would have);
+      * pass ``reset_ttl=True`` to restart the lifetime with the storage
+        ``max_age``, or ``max_age=<seconds>`` to restart it with an
+        explicit value.
+
+      :class:`IdentityRevokedError` (a subclass of
+      :class:`SessionRotationError`) is raised for duplicate rotation
+      requests for an identity that was already rotated or invalidated,
+      and by a late save onto a revoked identity.
+
+      .. warning::
+
+         Rotation requires server-side state and is supported by
+         :class:`~aiohttp_session.redis_storage.RedisStorage` and
+         :class:`~aiohttp_session.memcached_storage.MemcachedStorage`.
+         Self-contained cookie storages
+         (:class:`SimpleCookieStorage`,
+         :class:`~aiohttp_session.cookie_storage.EncryptedCookieStorage`,
+         :class:`~aiohttp_session.nacl_storage.NaClCookieStorage`) raise
+         :class:`IdentityRotationUnsupported`: with no server-side
+         record there is nothing to revoke, so an old cookie cannot be
+         invalidated.
+
 .. _aiohttp-session-storage:
 
 Session storages
