@@ -37,7 +37,42 @@ Public functions
 
       async def handler(request):
           session = await new_session(request)
-          session.new == True # This will always be True
+        session.new == True # This will always be True
+
+.. function:: commit_session(request, response=None)
+
+   A :ref:`coroutine<coroutine>` that persists the request session and
+   freezes it before the response headers are sent -- the streaming
+   session checkpoint.
+
+   The :func:`session_middleware` commits the session automatically for
+   every response (regular :class:`~aiohttp.web.Response`, raised
+   :class:`~aiohttp.web.HTTPException` and chunked
+   :class:`~aiohttp.web.StreamResponse`), so the cookie is present in the
+   very first header batch even when the handler awaits
+   ``response.prepare(request)`` itself.  Most handlers do not need to call
+   this function.
+
+   Call it explicitly to freeze the session at a chosen point in a
+   streaming handler, passing the response the ``Set-Cookie`` header
+   should be attached to::
+
+       resp = web.StreamResponse()
+       await commit_session(request, resp)
+       await resp.prepare(request)
+
+   The call is idempotent (the session is saved at most once).  Once the
+   session is committed it is frozen: any subsequent mutation raises
+   :class:`RuntimeError` immediately instead of being silently dropped
+   when the connection closes.
+
+   The storage backend is never touched unless :func:`get_session` or
+   :func:`new_session` was awaited and the session is marked as changed.
+   If the storage raises while committing, the exception propagates out
+   of ``response.prepare(request)`` *before* the success response headers
+   are sent, so no success response can leak without the cookie.
+
+   .. versionadded:: 2.13
 
 .. function:: session_middleware(storage)
 
@@ -155,6 +190,23 @@ Session
       .. warning::
 
          Never change :py:attr:`identity` of a session which is not new.
+
+   .. attribute:: frozen
+
+      A boolean.  Once the session has been committed (the response
+      headers are being sent) the session becomes read-only.  Any
+      mutation -- item assignment/deletion, :meth:`changed` or
+      :meth:`invalidate` -- raises :class:`RuntimeError` immediately.
+
+      .. versionadded:: 2.13
+
+   .. method:: freeze()
+
+      Mark the session as read-only (:py:attr:`frozen` becomes ``True``).
+      This is normally called by the streaming checkpoint /
+      :func:`commit_session`.
+
+      .. versionadded:: 2.13
 
 .. _aiohttp-session-storage:
 

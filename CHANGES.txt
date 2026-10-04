@@ -1,5 +1,20 @@
 .. towncrier release notes start
 
+2.13.0 (unreleased)
+===================
+
+* Add explicit streaming session support.  A session that was loaded and
+  changed before the first ``StreamResponse.prepare()`` is now saved into
+  the very first response header batch (so the ``Set-Cookie`` header reaches
+  the client even for chunked/streaming responses).  Add
+  :func:`aiohttp_session.commit_session` as the explicit checkpoint and
+  freeze the session once committed: any later mutation raises
+  ``RuntimeError`` immediately instead of being silently lost at connection
+  close.  A storage failure raised while committing aborts the response
+  before the success headers are sent.  Regular ``Response``,
+  ``HTTPException`` and WebSocket behavior is unchanged, and storage is not
+  accessed for requests that never load a session.
+
 2.12.1 (2024-09-25)
 ===================
 
