@@ -5,7 +5,7 @@ __version__ = "2.12.1"
 import abc
 import json
 import time
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterable, Iterator, MutableMapping
 from typing import Any, TypedDict, cast
 
 from aiohttp import web
@@ -129,15 +129,54 @@ class Session(MutableMapping[str, Any]):
 
 SESSION_KEY = "aiohttp_session"
 STORAGE_KEY = "aiohttp_session_storage"
+APP_REGISTRY_KEY = web.AppKey("aiohttp_session_registry", dict)
+DEFAULT_NAMESPACE = "default"
 
 
-async def get_session(request: web.Request) -> Session:
-    session = request.get(SESSION_KEY)
+def _session_key(namespace: str) -> str:
+    if namespace == DEFAULT_NAMESPACE:
+        return SESSION_KEY
+    return f"{SESSION_KEY}:{namespace}"
+
+
+def _storage_key(namespace: str) -> str:
+    if namespace == DEFAULT_NAMESPACE:
+        return STORAGE_KEY
+    return f"{STORAGE_KEY}:{namespace}"
+
+
+class SessionSaveError(RuntimeError):
+    """Raised when saving one of the registered session namespaces fails.
+
+    Namespaces are saved sequentially in registration order and there is
+    no distributed transaction across storages: ``saved`` lists the
+    namespaces that were already persisted on the server side before
+    ``failed`` raised, i.e. the write boundary.  The response is
+    discarded, so no partial set of session cookies is sent to the
+    client.
+    """
+
+    def __init__(self, *, failed: str, saved: Iterable[str]) -> None:
+        self.failed = failed
+        self.saved = tuple(saved)
+        persisted = ", ".join(repr(name) for name in self.saved) or "none"
+        super().__init__(
+            f"Failed to save session namespace {failed!r}; namespaces already "
+            f"persisted on the server side: {persisted}. The response was not "
+            "sent, so no partial session cookies were delivered."
+        )
+
+
+async def get_session(
+    request: web.Request, *, namespace: str = DEFAULT_NAMESPACE
+) -> Session:
+    session = request.get(_session_key(namespace))
     if session is None:
-        storage = request.get(STORAGE_KEY)
+        storage = request.get(_storage_key(namespace))
         if storage is None:
             raise RuntimeError(
-                "Install aiohttp_session middleware " "in your aiohttp.web.Application"
+                f"Session namespace {namespace!r} is not available, install "
+                "aiohttp_session middleware in your aiohttp.web.Application"
             )
 
         session = await storage.load_session(request)
@@ -146,15 +185,18 @@ async def get_session(request: web.Request) -> Session:
                 "Installed {!r} storage should return session instance "
                 "on .load_session() call, got {!r}.".format(storage, session)
             )
-        request[SESSION_KEY] = session
+        request[_session_key(namespace)] = session
     return session
 
 
-async def new_session(request: web.Request) -> Session:
-    storage = request.get(STORAGE_KEY)
+async def new_session(
+    request: web.Request, *, namespace: str = DEFAULT_NAMESPACE
+) -> Session:
+    storage = request.get(_storage_key(namespace))
     if storage is None:
         raise RuntimeError(
-            "Install aiohttp_session middleware " "in your aiohttp.web.Application"
+            f"Session namespace {namespace!r} is not available, install "
+            "aiohttp_session middleware in your aiohttp.web.Application"
         )
 
     session = await storage.new_session()
@@ -163,17 +205,19 @@ async def new_session(request: web.Request) -> Session:
             "Installed {!r} storage should return session instance "
             "on .load_session() call, got {!r}.".format(storage, session)
         )
-    request[SESSION_KEY] = session
+    request[_session_key(namespace)] = session
     return session
 
 
-def session_middleware(storage: "AbstractStorage") -> Middleware:
+def session_middleware(
+    storage: "AbstractStorage", *, namespace: str = DEFAULT_NAMESPACE
+) -> Middleware:
     if not isinstance(storage, AbstractStorage):
         raise RuntimeError(f"Expected AbstractStorage got {storage}")
 
     @web.middleware
     async def factory(request: web.Request, handler: Handler) -> web.StreamResponse:
-        request[STORAGE_KEY] = storage
+        request[_storage_key(namespace)] = storage
         raise_response = False
         # TODO aiohttp 4:
         # Remove Union from response, and drop the raise_response variable
@@ -190,7 +234,7 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
             return response
         if response.prepared:
             raise RuntimeError("Cannot save session data into prepared response")
-        session = request.get(SESSION_KEY)
+        session = request.get(_session_key(namespace))
         if session is not None:
             if session._changed:
                 await storage.save_session(request, response, session)
@@ -201,10 +245,82 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
     return factory
 
 
-def setup(app: web.Application, storage: "AbstractStorage") -> None:
-    """Setup the library in aiohttp fashion."""
+@web.middleware
+async def _session_registry_middleware(
+    request: web.Request, handler: Handler
+) -> web.StreamResponse:
+    registry: dict[str, AbstractStorage] = request.app.get(APP_REGISTRY_KEY, {})
+    for namespace, storage in registry.items():
+        request[_storage_key(namespace)] = storage
+    raise_response = False
+    response: web.StreamResponse | web.HTTPException
+    try:
+        response = await handler(request)
+    except web.HTTPException as exc:
+        response = exc
+        raise_response = True
+    if not isinstance(response, (web.StreamResponse, web.HTTPException)):
+        raise RuntimeError(f"Expect response, not {type(response)!r}")
+    if not isinstance(response, (web.Response, web.HTTPException)):
+        # likely got websocket or streaming
+        return response
+    if response.prepared:
+        raise RuntimeError("Cannot save session data into prepared response")
+    # Save namespaces in registration order.  Storages do not share a
+    # transaction: if one save fails, report the server-side write
+    # boundary and discard the response so no partial set of session
+    # cookies is sent.
+    saved: list[str] = []
+    for namespace, storage in registry.items():
+        session = request.get(_session_key(namespace))
+        if session is None or not session._changed:
+            continue
+        try:
+            await storage.save_session(request, response, session)
+        except Exception as exc:
+            raise SessionSaveError(failed=namespace, saved=saved) from exc
+        saved.append(namespace)
+    if raise_response:
+        raise cast(web.HTTPException, response)
+    return response
 
-    app.middlewares.append(session_middleware(storage))
+
+def _cookie_identity(storage: "AbstractStorage") -> tuple[str, str | None, str]:
+    params = storage.cookie_params
+    return (storage.cookie_name, params["domain"], params["path"])
+
+
+def setup(
+    app: web.Application,
+    storage: "AbstractStorage",
+    *,
+    namespace: str = DEFAULT_NAMESPACE,
+) -> None:
+    """Setup the library in aiohttp fashion."""
+    if not isinstance(storage, AbstractStorage):
+        raise RuntimeError(f"Expected AbstractStorage got {storage}")
+    registry = app.get(APP_REGISTRY_KEY)
+    if registry is None:
+        registry = {}
+        app[APP_REGISTRY_KEY] = registry
+        # A single middleware serves every registered namespace, so a
+        # duplicate setup() call can never save the same session twice.
+        app.middlewares.append(_session_registry_middleware)
+    if namespace in registry:
+        raise RuntimeError(
+            f"Session namespace {namespace!r} is already registered, "
+            "refusing to install a duplicate middleware that would save "
+            "the same session twice"
+        )
+    for existing_namespace, existing in registry.items():
+        if _cookie_identity(existing) == _cookie_identity(storage):
+            raise ValueError(
+                f"Cookie configuration of namespace {namespace!r} conflicts "
+                f"with already registered namespace {existing_namespace!r}: "
+                "cookie name/domain/path "
+                f"{_cookie_identity(storage)!r} would overwrite each other"
+            )
+    registry[namespace] = storage
 
 
 class AbstractStorage(metaclass=abc.ABCMeta):

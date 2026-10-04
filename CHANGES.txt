@@ -1,5 +1,17 @@
 .. towncrier release notes start
 
+Unreleased
+==========
+
+* Added optional session namespaces: ``setup()``, ``get_session()``,
+  ``new_session()`` and ``session_middleware()`` accept a ``namespace``
+  keyword so several independent sessions (e.g. a short-lived login
+  session and a longer-lived preferences session) can be backed by
+  different storages.  Namespaces are saved in registration order by a
+  single shared middleware; a failing save raises
+  ``SessionSaveError`` reporting the server-side write boundary and no
+  partial set of session cookies is sent.
+
 2.12.1 (2024-09-25)
 ===================
 

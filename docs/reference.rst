@@ -13,18 +13,24 @@
 Public functions
 ================
 
-.. function:: get_session(request)
+.. function:: get_session(request, *, namespace="default")
 
    A :ref:`coroutine<coroutine>` for getting session instance from
    request object.
 
+   *namespace* selects which registered session to load; the default
+   namespace keeps the historical behavior.  Each namespace is loaded
+   lazily on first access and cached on the request under its own key.
+
    See example below in :ref:`Session<aiohttp-session-session>`
    section for :func:`get_session` usage.
 
-.. function:: new_session(request)
+.. function:: new_session(request, *, namespace="default")
 
    A :ref:`coroutine<coroutine>` for getting a new session regardless
    of whether a cookie exists.
+
+   *namespace* selects which registered session to replace.
 
    .. warning::
 
@@ -39,7 +45,7 @@ Public functions
           session = await new_session(request)
           session.new == True # This will always be True
 
-.. function:: session_middleware(storage)
+.. function:: session_middleware(storage, *, namespace="default")
 
    Session middleware factory.
 
@@ -50,17 +56,15 @@ Public functions
    session data into cookies, Redis, database etc., class is derived
    from :class:`AbstractStorage`).
 
+   *namespace* selects the session namespace this middleware serves.
+
    .. seealso:: :ref:`aiohttp-session-storage`
 
    .. note:: :func:`setup` is new-fashion way for library setup.
 
-.. function:: setup(app, storage)
+.. function:: setup(app, storage, *, namespace="default")
 
    Setup session support for given *app*.
-
-   The function is shortcut for::
-
-      app.middlewares.append(session_middleware(storage))
 
    *app* is :class:`aiohttp.web.Application` instance.
 
@@ -68,7 +72,43 @@ Public functions
    session data into cookies, Redis, database etc., class is derived
    from :class:`AbstractStorage`).
 
+   *namespace* names the session; call :func:`setup` once per
+   namespace to run several independent sessions (e.g. a short-lived
+   login session and a longer-lived UI preferences session) backed by
+   different storages::
+
+      setup(app, RedisStorage(redis_pool, cookie_name="AIOHTTP_AUTH"))
+      setup(app, EncryptedCookieStorage(key, cookie_name="AIOHTTP_PREFS"),
+            namespace="prefs")
+
+   All namespaces share a single middleware installed by the first
+   :func:`setup` call, so a session can never be saved twice by
+   duplicate middleware.  Registering the same *namespace* twice
+   raises :exc:`RuntimeError`, and registering two namespaces whose
+   cookie name/domain/path would overwrite each other raises
+   :exc:`ValueError`.
+
+   Changed sessions are saved in registration order.  Storages do not
+   share a transaction: if saving one namespace fails, a
+   :exc:`SessionSaveError` is raised describing which namespaces were
+   already persisted on the server side, and the response is discarded
+   so no partial set of session cookies is sent to the client.
+
    .. seealso:: :ref:`aiohttp-session-storage`
+
+.. exception:: SessionSaveError
+
+   Raised when saving one of the registered session namespaces fails.
+
+   .. attribute:: failed
+
+      The namespace whose save raised.
+
+   .. attribute:: saved
+
+      Tuple of namespaces already persisted on the server side before
+      the failure, in save order.  The client response is discarded,
+      so no partial set of session cookies is ever sent.
 
 
 .. _aiohttp-session-session:

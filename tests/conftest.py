@@ -7,10 +7,26 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from typing import TypedDict
 
-import aiomcache
 import pytest
-from docker import DockerClient, from_env as docker_from_env, models as docker_models
-from redis import asyncio as aioredis
+
+try:
+    import aiomcache
+except ImportError:  # pragma: no cover
+    aiomcache = None  # type: ignore[assignment]
+
+try:
+    from docker import (
+        DockerClient,
+        from_env as docker_from_env,
+        models as docker_models,
+    )
+except ImportError:  # pragma: no cover
+    docker_from_env = None  # type: ignore[assignment]
+
+try:
+    from redis import asyncio as aioredis
+except ImportError:  # pragma: no cover
+    aioredis = None  # type: ignore[assignment]
 
 
 class _ContainerInfo(TypedDict):
@@ -42,6 +58,8 @@ def session_id() -> str:
 
 @pytest.fixture(scope="session")
 def docker() -> DockerClient:  # type: ignore[misc]  # No docker types.
+    if docker_from_env is None:
+        pytest.skip("docker is not installed")
     client = docker_from_env(version="auto")
     yield client
     client.close()
