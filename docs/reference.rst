@@ -39,6 +39,40 @@ Public functions
           session = await new_session(request)
           session.new == True # This will always be True
 
+.. function:: commit_session(request, response)
+
+   A :ref:`coroutine<coroutine>` for explicitly saving the session into
+   a streaming (:class:`aiohttp.web.StreamResponse`) response.
+
+   The middleware only saves sessions automatically for regular
+   :class:`aiohttp.web.Response` and :class:`aiohttp.web.HTTPException`
+   results. For streaming responses call :func:`commit_session` as a
+   checkpoint *before* ``await response.prepare(request)``, so the
+   session is persisted and the cookie is set while the response
+   headers can still be modified. If saving fails, the exception
+   propagates before any success headers are sent.
+
+   After the checkpoint the session is frozen: any further modification
+   raises :exc:`RuntimeError` immediately instead of being silently
+   discarded when the connection ends.
+
+   The call is a no-op when the session was never accessed, so storage
+   is not touched for requests that don't use sessions, and repeated
+   calls are harmless.
+
+   Example usage::
+
+      from aiohttp_session import commit_session, get_session
+
+      async def handler(request):
+          session = await get_session(request)
+          session['key'] = 'value'
+          resp = web.StreamResponse()
+          await commit_session(request, resp)  # checkpoint
+          await resp.prepare(request)
+          await resp.write(b'chunk')
+          return resp
+
 .. function:: session_middleware(storage)
 
    Session middleware factory.
@@ -114,6 +148,18 @@ Session
 
       A boolean. If new is ``True``, this session is new. Otherwise,
       it has been constituted from data that was already serialized.
+
+   .. attribute:: frozen
+
+      A boolean. If frozen is ``True``, the session can no longer be
+      modified; any mutation raises :exc:`RuntimeError`. Sessions are
+      frozen after a streaming checkpoint, see :func:`commit_session`.
+
+   .. method:: freeze()
+
+      Forbid further modifications of the session. Called by
+      :func:`commit_session` and by the middleware when a prepared
+      streaming response is returned without committing the session.
 
    .. method:: changed()
 

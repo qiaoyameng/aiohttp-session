@@ -1,5 +1,13 @@
 .. towncrier release notes start
 
+Unreleased
+==========
+
+* Added ``aiohttp_session.commit_session()`` for explicitly saving the
+  session into streaming responses before headers are sent. After the
+  checkpoint the session is frozen and further modifications raise
+  ``RuntimeError`` immediately.
+
 2.12.1 (2024-09-25)
 ===================
 

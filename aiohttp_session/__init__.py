@@ -40,6 +40,7 @@ class Session(MutableMapping[str, Any]):
         max_age: int | None = None,
     ) -> None:
         self._changed: bool = False
+        self._frozen: bool = False
         self._mapping: dict[str, Any] = {}
         self._identity = identity if data != {} else None
         self._new = new if data != {} else True
@@ -84,21 +85,42 @@ class Session(MutableMapping[str, Any]):
         return not bool(self._mapping)
 
     @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    def freeze(self) -> None:
+        """Forbid further modifications of the session.
+
+        Called once the session can no longer be saved (e.g. after a
+        streaming response checkpoint), so that late writes fail fast
+        instead of being silently discarded.
+        """
+        self._frozen = True
+
+    def _check_frozen(self) -> None:
+        if self._frozen:
+            raise RuntimeError("Cannot modify frozen session")
+
+    @property
     def max_age(self) -> int | None:
         return self._max_age
 
     @max_age.setter
     def max_age(self, value: int | None) -> None:
+        self._check_frozen()
         self._max_age = value
 
     def changed(self) -> None:
+        self._check_frozen()
         self._changed = True
 
     def invalidate(self) -> None:
+        self._check_frozen()
         self._changed = True
         self._mapping = {}
 
     def set_new_identity(self, identity: Any | None) -> None:
+        self._check_frozen()
         if not self._new:
             raise RuntimeError("Can't change identity for a session which is not new")
 
@@ -117,11 +139,13 @@ class Session(MutableMapping[str, Any]):
         return self._mapping[key]
 
     def __setitem__(self, key: str, value: Any) -> None:
+        self._check_frozen()
         self._mapping[key] = value
         self._changed = True
         self._created = int(time.time())
 
     def __delitem__(self, key: str) -> None:
+        self._check_frozen()
         del self._mapping[key]
         self._changed = True
         self._created = int(time.time())
@@ -167,6 +191,38 @@ async def new_session(request: web.Request) -> Session:
     return session
 
 
+async def commit_session(request: web.Request, response: web.StreamResponse) -> None:
+    """Explicitly save the session into a streaming response.
+
+    Acts as a checkpoint: call it before ``await response.prepare(request)``
+    so the session is persisted and the cookie is set while the response
+    headers can still be modified. If saving fails the exception propagates
+    before any success headers are sent.
+
+    After the checkpoint the session is frozen; any further modification
+    raises ``RuntimeError`` immediately instead of being silently lost.
+
+    Does nothing if the session was never accessed, so storage is not
+    touched for requests that don't use sessions.
+    """
+    session = request.get(SESSION_KEY)
+    if session is None:
+        return
+    if session.frozen:
+        # Already committed, repeated calls are harmless no-ops.
+        return
+    if response.prepared:
+        raise RuntimeError("Cannot commit session into prepared response")
+    storage = request.get(STORAGE_KEY)
+    if storage is None:
+        raise RuntimeError(
+            "Install aiohttp_session middleware in your aiohttp.web.Application"
+        )
+    if session._changed:
+        await storage.save_session(request, response, session)
+    session.freeze()
+
+
 def session_middleware(storage: "AbstractStorage") -> Middleware:
     if not isinstance(storage, AbstractStorage):
         raise RuntimeError(f"Expected AbstractStorage got {storage}")
@@ -187,6 +243,13 @@ def session_middleware(storage: "AbstractStorage") -> Middleware:
             raise RuntimeError(f"Expect response, not {type(response)!r}")
         if not isinstance(response, (web.Response, web.HTTPException)):
             # likely got websocket or streaming
+            if response.prepared:
+                # Headers are already sent, the session can no longer be
+                # saved. Freeze it so late modifications fail fast instead
+                # of being silently discarded at connection end.
+                session = request.get(SESSION_KEY)
+                if session is not None:
+                    session.freeze()
             return response
         if response.prepared:
             raise RuntimeError("Cannot save session data into prepared response")
