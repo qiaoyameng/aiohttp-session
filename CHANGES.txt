@@ -1,5 +1,28 @@
 .. towncrier release notes start
 
+2.13.0 (UNRELEASED)
+===================
+
+* Added the server side identity rotation protocol
+  (``Session.rotate_identity`` / ``AbstractStorage.rotate_identity``) for
+  changing the session ID after login or privilege elevation while
+  migrating selected fields (e.g. the shopping cart).
+* ``RedisStorage`` performs rotation atomically with a Lua script: a new
+  identity with a fresh generation tag is created, chosen fields are
+  migrated and the old identity gets a tombstone; saves use a generation
+  compare-and-set so a request that loaded the old identity before
+  rotation cannot resurrect it with a late save.
+* Added ``TTLPolicy.PRESERVE`` (keep the absolute expiry deadline across
+  rotation and later saves) and ``TTLPolicy.RESET`` (explicitly start a
+  fresh lifetime; the tombstone still honours the old deadline).
+* The session cookie is only updated by the middleware after a
+  successful rotation; saving into a prepared response is rejected as
+  before.
+* Added ``IdentityRevokedError``, ``RotationNotSupportedError`` and the
+  ``SessionRotationError`` base class. Self-contained cookie storages
+  intentionally do not promise server side revocation and raise
+  ``RotationNotSupportedError``.
+
 2.12.1 (2024-09-25)
 ===================
 

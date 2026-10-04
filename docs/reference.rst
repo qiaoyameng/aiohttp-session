@@ -156,6 +156,86 @@ Session
 
          Never change :py:attr:`identity` of a session which is not new.
 
+   .. method:: rotate_identity(request, *, fields=None, ttl=TTLPolicy.PRESERVE)
+
+      A :ref:`coroutine<coroutine>` for atomically rotating the session
+      identity after a login or privilege elevation while keeping selected
+      data (e.g. the shopping cart). The backend storage performs the whole
+      operation atomically:
+
+      1. a new identity with a fresh generation tag is minted;
+      2. the selected *fields* are migrated to it;
+      3. the old identity is revoked and keeps a **tombstone** tagged with
+         the new generation.
+
+      The tombstone blocks late saves from requests that loaded the old
+      identity before the rotation: such a save is refused, so the old
+      identity can never be resurrected and an old cookie can never retrieve
+      the logged-in state again.
+
+      *fields* selects which session keys migrate:
+
+      * ``None`` (default) -- migrate every key;
+      * a :class:`str` -- migrate a single key;
+      * a collection of :class:`str` -- migrate the listed keys;
+      * a callable ``key -> bool`` -- migrate the keys it accepts.
+
+      *ttl* chooses the lifetime policy:
+
+      * :data:`TTLPolicy.PRESERVE` (default) keeps the old **absolute**
+        expiry deadline. The returned session and subsequent saves use the
+        remaining lifetime, so rotation never extends the security
+        deadline;
+      * :data:`TTLPolicy.RESET` (or the string ``"reset"``) starts a fresh
+        storage lifetime for the new identity. The tombstone still honours
+        the old deadline.
+
+      The session cookie is **not** written by this call. It is updated by
+      :func:`session_middleware` only after the rotation succeeds and only
+      when the session is saved into a non-prepared response. If the
+      backend rotation fails, neither the identity nor the cookie changes.
+
+      Calling rotation a second time with a session that still holds the
+      old generation (duplicate/concurrent requests, or a request
+      interleaved with :meth:`invalidate`) raises
+      :class:`IdentityRevokedError`. Use :meth:`invalidate` first to log
+      out without migrating data; rotating an already invalidated/empty
+      session raises :class:`RuntimeError`.
+
+      Self-contained cookie storages
+      (:class:`SimpleCookieStorage`, :class:`~aiohttp_session.cookie_storage.EncryptedCookieStorage`,
+      :class:`~aiohttp_session.nacl_storage.NaClCookieStorage`) keep no
+      server side state: they cannot revoke an already issued cookie and
+      therefore raise :class:`RotationNotSupportedError`. Use a server side
+      storage (:class:`~aiohttp_session.redis_storage.RedisStorage`) for
+      privilege changing operations.
+
+      Example::
+
+         from aiohttp_session import get_session, TTLPolicy
+
+         async def login(request):
+             session = await get_session(request)
+             # ... authenticate the user ...
+             await session.rotate_identity(
+                 request,
+                 fields={"cart"},          # keep the shopping cart
+                 ttl=TTLPolicy.PRESERVE,
+             )
+             session["user_id"] = user.id
+             return web.Response(text="welcome")
+
+      .. versionadded:: 2.13
+
+   .. attribute:: gen
+
+      Opaque generation tag (:class:`str` or ``None``) of the current
+      identity, assigned by server side storages. It changes on every
+      :meth:`rotate_identity` and is used internally to reject stale
+      saves. ``None`` for new sessions and cookie storages.
+
+      .. versionadded:: 2.13
+
 .. _aiohttp-session-storage:
 
 Session storages
@@ -256,6 +336,72 @@ implement both :meth:`~AbstractStorage.load_session` and
       given *request* (:class:`aiohttp.web.Request`) using *response*
       (:class:`aiohttp.web.StreamResponse` or descendants).
 
+      Implementations that participate in identity rotation must refuse
+      a save whose generation no longer matches the backend state (a
+      tombstone created by :meth:`rotate_identity` or :meth:`Session.invalidate`):
+      the late write must be ignored instead of resurrecting the revoked
+      identity, and no cookie should be emitted for it.
+
+   .. method:: rotate_identity(request, session, *, fields=None, ttl=TTLPolicy.PRESERVE)
+
+      A :ref:`coroutine<coroutine>` for the atomic identity rotation
+      protocol. Server side storages override this to perform, in one
+      backend atomic operation: mint a new identity with a fresh
+      generation, copy the keys selected by *fields* (``None``, a
+      :class:`str`, a collection of :class:`str` or a predicate) and
+      revoke the old identity with a tombstone carrying the new
+      generation.
+
+      *ttl* is a :class:`TTLPolicy`: :data:`TTLPolicy.PRESERVE` keeps the
+      old absolute deadline (including on later saves),
+      :data:`TTLPolicy.RESET` grants a fresh lifetime while the tombstone
+      still expires at the old deadline.
+
+      Returns a :class:`RotationResult` mapping with the new ``identity``,
+      ``gen``, migrated ``data`` and the effective cookie ``max_age``.
+      Raises :class:`IdentityRevokedError` when the old identity was
+      already rotated or invalidated.
+
+      The default implementation raises
+      :class:`RotationNotSupportedError`, which is the correct behaviour
+      for self-contained cookie storages: they make no server side
+      revocation promise.
+
+      .. versionadded:: 2.13
+
+   .. class:: TTLPolicy
+
+      Enum with two members:
+
+      * :data:`TTLPolicy.PRESERVE` -- keep the absolute expiry deadline
+        across rotation;
+      * :data:`TTLPolicy.RESET` -- start a fresh lifetime for the new
+        identity.
+
+      .. versionadded:: 2.13
+
+   .. exception:: SessionRotationError
+
+      Base class for identity rotation failures (a :class:`RuntimeError`).
+
+      .. versionadded:: 2.13
+
+   .. exception:: IdentityRevokedError
+
+      The target identity was revoked by a rotation or invalidation, or
+      expired. Raised on duplicate rotations and used to guard stale
+      writes. Subclass of :class:`SessionRotationError`.
+
+      .. versionadded:: 2.13
+
+   .. exception:: RotationNotSupportedError
+
+      The storage has no server side state and cannot revoke identities
+      (self-contained cookie storages). Subclass of
+      :class:`SessionRotationError`.
+
+      .. versionadded:: 2.13
+
    .. method:: load_cookie(request)
 
       A helper for loading cookie (:class:`http.cookies.SimpleCookie`
@@ -329,6 +475,17 @@ To use the storage you should push it into
 
    Other parameters are the same as for
    :class:`~aiohttp_session.AbstractStorage` constructor.
+
+   The storage implements :meth:`~AbstractStorage.rotate_identity`
+   atomically with a Redis Lua script: the new record and the old
+   identity tombstone are written in one round trip, and every save uses
+   a generation compare-and-swap so that a request holding the pre-
+   rotation identity cannot overwrite the new record. Call
+   :meth:`Session.rotate_identity` after login or privilege elevation.
+
+   .. versionadded:: 2.13
+
+      Identity rotation protocol with generation tags and tombstones.
 
    .. note::
 

@@ -3,13 +3,48 @@
 __version__ = "2.12.1"
 
 import abc
+import enum
 import json
 import time
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping
 from typing import Any, TypedDict, cast
 
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
+
+
+class SessionRotationError(RuntimeError):
+    """Base class for session identity rotation failures."""
+
+
+class IdentityRevokedError(SessionRotationError):
+    """The identity is revoked by a rotation or invalidation.
+
+    Raised when a rotation or a save targets an identity whose generation no
+    longer matches the backend state -- e.g. a request that loaded the old
+    identity before rotation and tries to save after the rotation completed.
+    """
+
+
+class RotationNotSupportedError(SessionRotationError):
+    """Storage cannot revoke old identities.
+
+    Self-contained cookie storages (plain/encrypted/signed cookies) have no
+    server side state to atomically rotate, so they do not implement the
+    ``rotate_identity`` protocol.
+    """
+
+
+class TTLPolicy(enum.Enum):
+    """How a rotation treats the session lifetime."""
+
+    PRESERVE = "preserve"
+    RESET = "reset"
+
+
+#: A single key, a collection of keys, a predicate on the key or ``None`` for
+#: "migrate every field".
+FieldsSelector = "str | Collection[str] | Callable[[str], bool] | None"
 
 
 class _CookieParams(TypedDict, total=False):
@@ -24,7 +59,15 @@ class _CookieParams(TypedDict, total=False):
 
 class SessionData(TypedDict, total=False):
     created: int
+    gen: str
     session: dict[str, Any]
+
+
+class RotationResult(TypedDict):
+    identity: str
+    gen: str
+    data: dict[str, Any]
+    max_age: int | None
 
 
 class Session(MutableMapping[str, Any]):
@@ -38,12 +81,14 @@ class Session(MutableMapping[str, Any]):
         data: SessionData | None,
         new: bool,
         max_age: int | None = None,
+        gen: str | None = None,
     ) -> None:
         self._changed: bool = False
         self._mapping: dict[str, Any] = {}
         self._identity = identity if data != {} else None
         self._new = new if data != {} else True
         self._max_age = max_age
+        self._gen = gen
         created = data.get("created", None) if data else None
         session_data = data.get("session", None) if data else None
         now = int(time.time())
@@ -76,6 +121,15 @@ class Session(MutableMapping[str, Any]):
         return self._identity
 
     @property
+    def gen(self) -> str | None:
+        """Opaque generation tag of the current identity.
+
+        ``None`` for sessions created client side or by storages that do not
+        participate in the :meth:`AbstractStorage.rotate_identity` protocol.
+        """
+        return self._gen
+
+    @property
     def created(self) -> int:
         return self._created
 
@@ -97,6 +151,61 @@ class Session(MutableMapping[str, Any]):
     def invalidate(self) -> None:
         self._changed = True
         self._mapping = {}
+
+    async def rotate_identity(
+        self,
+        request: web.Request,
+        *,
+        fields: FieldsSelector = None,
+        ttl: TTLPolicy | str = TTLPolicy.PRESERVE,
+    ) -> str:
+        """Atomically revoke the current identity and take over a new one.
+
+        Must be called after login or privilege elevation to prevent session
+        fixation. The backend storage creates a brand new identity, migrates
+        the selected *fields* and revokes the old identity in one atomic
+        operation; the old identity keeps a tombstone so that requests which
+        loaded it before the rotation cannot resurrect it with a late save.
+
+        *fields* selects which session keys to migrate: ``None`` (default)
+        migrates every key, a string migrates one key, a collection of
+        strings migrates the listed keys and a callable gets each key and
+        migrates it when the predicate returns a truthy value.
+
+        *ttl* is :data:`TTLPolicy.PRESERVE` (default) to keep the old
+        absolute expiry deadline, or :data:`TTLPolicy.RESET` / ``"reset"``
+        for a fresh storage lifetime.
+
+        Returns the new identity string. Raises
+        :class:`IdentityRevokedError` if the old identity was already
+        rotated or invalidated (this covers duplicate/concurrent rotation
+        requests and late saves), and :class:`RotationNotSupportedError`
+        for self-contained cookie storages.
+
+        The cookie itself is only updated later by the session middleware
+        when it saves the session into the response; call this before the
+        response is prepared.
+        """
+        if self.empty:
+            raise RuntimeError(
+                "Cannot rotate identity of an empty or invalidated session"
+            )
+        storage = request.get(STORAGE_KEY)
+        if storage is None:
+            raise RuntimeError(
+                "Install aiohttp_session middleware "
+                "in your aiohttp.web.Application"
+            )
+        result = await storage.rotate_identity(
+            request, self, fields=fields, ttl=ttl
+        )
+        self._identity = result["identity"]
+        self._gen = result["gen"]
+        self._mapping = dict(result["data"])
+        self._changed = True
+        if result["max_age"] is not None:
+            self._max_age = result["max_age"]
+        return result["identity"]
 
     def set_new_identity(self, identity: Any | None) -> None:
         if not self._new:
@@ -250,10 +359,91 @@ class AbstractStorage(metaclass=abc.ABCMeta):
         if session.empty:
             return {}
 
-        return {"created": session.created, "session": session._mapping}
+        data: SessionData = {"created": session.created, "session": session._mapping}
+        if session.gen is not None:
+            data["gen"] = session.gen
+        return data
+
+    @staticmethod
+    def _select_fields(
+        mapping: Mapping[str, Any], fields: FieldsSelector
+    ) -> dict[str, Any]:
+        if fields is None:
+            return dict(mapping)
+        if isinstance(fields, str):
+            return {fields: mapping[fields]} if fields in mapping else {}
+        if callable(fields):
+            return {key: value for key, value in mapping.items() if fields(key)}
+        if isinstance(fields, Collection):
+            return {
+                key: mapping[key] for key in fields if key in mapping
+            }
+        raise TypeError(f"Unsupported fields selector: {fields!r}")
+
+    @staticmethod
+    def _ttl_policy(ttl: TTLPolicy | str) -> TTLPolicy:
+        if isinstance(ttl, str) and not isinstance(ttl, TTLPolicy):
+            try:
+                ttl = TTLPolicy(ttl)
+            except ValueError:
+                raise ValueError(
+                    f"Unsupported TTL policy: {ttl!r}, "
+                    "expected TTLPolicy.PRESERVE or TTLPolicy.RESET"
+                ) from None
+        if not isinstance(ttl, TTLPolicy):
+            raise TypeError(f"Unsupported TTL policy: {ttl!r}")
+        return ttl
+
+    def _rotation_ttls(
+        self,
+        session: "Session",
+        ttl: TTLPolicy,
+    ) -> tuple[int | None, int | None]:
+        """Return ``(new_ttl, tombstone_ttl)`` seconds for a rotation.
+
+        ``PRESERVE`` keeps the absolute deadline of the old session: the new
+        record and the tombstone share the old remaining lifetime, so the
+        security deadline is never extended. ``RESET`` gives the new record
+        the storage default lifetime while the tombstone keeps the old
+        remaining lifetime (it must never outlive the deadline the user was
+        granted).
+        """
+        default = self.max_age
+        if session.max_age is None:
+            return default, None
+        remaining = session.created + session.max_age - int(time.time())
+        if remaining < 1:
+            remaining = 1
+        if ttl is TTLPolicy.PRESERVE:
+            return remaining, remaining
+        return default, remaining
 
     async def new_session(self) -> Session:
         return Session(None, data=None, new=True, max_age=self.max_age)
+
+    async def rotate_identity(
+        self,
+        request: web.Request,
+        session: "Session",
+        *,
+        fields: FieldsSelector = None,
+        ttl: TTLPolicy | str = TTLPolicy.PRESERVE,
+    ) -> RotationResult:
+        """Atomically mint a new identity, migrate data and revoke the old.
+
+        Server side storages override this with a backend atomic operation
+        that (1) creates the new identity with a fresh generation,
+        (2) copies the selected fields and (3) revokes the old identity,
+        leaving a tombstone tagged with the new generation.
+
+        The default implementation raises
+        :class:`RotationNotSupportedError`: self-contained cookie storages
+        cannot revoke cookies that have already been issued and therefore
+        make no server side revocation promise.
+        """
+        raise RotationNotSupportedError(
+            f"{type(self).__name__} does not support identity rotation"
+        )
 
     @abc.abstractmethod
     async def load_session(self, request: web.Request) -> Session:

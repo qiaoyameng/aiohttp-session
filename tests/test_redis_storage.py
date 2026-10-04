@@ -20,6 +20,25 @@ from aiohttp_session.redis_storage import RedisStorage
 from .typedefs import AiohttpClient
 
 
+class _FakeRequest:
+    def __init__(self, storage: RedisStorage, cookie: str | None = None):
+        from aiohttp_session import STORAGE_KEY
+
+        self._mapping: dict[object, object] = {STORAGE_KEY: storage}
+        self.cookies: dict[str, str] = {}
+        if cookie is not None:
+            self.cookies[storage.cookie_name] = cookie
+
+    def __getitem__(self, key: object) -> object:
+        return self._mapping[key]
+
+    def __setitem__(self, key: object, value: object) -> None:
+        self._mapping[key] = value
+
+    def get(self, key: object, default: object = None) -> object:
+        return self._mapping.get(key, default)
+
+
 def create_app(
     handler: Handler,
     redis: aioredis.Redis,
@@ -349,3 +368,59 @@ async def test_load_session_dont_load_expired_session(
 
     resp = await client.get("/?exp=yes")
     assert resp.status == 200
+
+
+async def test_rotate_identity_revokes_old_and_blocks_late_save(
+    redis: aioredis.Redis,
+) -> None:
+    from aiohttp_session import IdentityRevokedError, TTLPolicy
+
+    storage = RedisStorage(redis, max_age=1000)
+
+    # An anonymous session holding a cart.
+    request = _FakeRequest(storage)
+    session = await storage.load_session(request)
+    session["cart"] = ["apple"]
+    session["anon"] = "token"
+    response = web.Response()
+    await storage.save_session(request, response, session)
+    old_key = response.cookies["AIOHTTP_SESSION"].value
+
+    # Two concurrent requests loaded the old generation.
+    login_request = _FakeRequest(storage, cookie=old_key)
+    login_session = await storage.load_session(login_request)
+    late_request = _FakeRequest(storage, cookie=old_key)
+    late_session = await storage.load_session(late_request)
+
+    # Login rotates the identity, migrating only the cart.
+    new_key = await login_session.rotate_identity(
+        login_request, fields={"cart"}, ttl=TTLPolicy.PRESERVE
+    )
+    assert new_key != old_key
+    assert dict(login_session) == {"cart": ["apple"]}
+    login_response = web.Response()
+    await storage.save_session(login_request, login_response, login_session)
+    assert login_response.cookies["AIOHTTP_SESSION"].value == new_key
+
+    # Old key is a tombstone tagged with the new generation.
+    old_raw = await redis.get("AIOHTTP_SESSION_" + old_key)
+    old_record = json.loads(old_raw)
+    assert old_record["tombstone"] is True
+    assert old_record["gen"] == login_session.gen
+
+    # The old cookie cannot retrieve the logged-in state.
+    reloaded = await storage.load_session(_FakeRequest(storage, cookie=old_key))
+    assert reloaded.new is True
+    assert dict(reloaded) == {}
+
+    # A late save from the stale request is refused silently.
+    late_session["cart"] = ["pwnd"]
+    late_response = web.Response()
+    await storage.save_session(late_request, late_response, late_session)
+    assert "AIOHTTP_SESSION" not in late_response.cookies
+    new_raw = await redis.get("AIOHTTP_SESSION_" + new_key)
+    assert json.loads(new_raw)["session"] == {"cart": ["apple"]}
+
+    # A second concurrent rotation of the old generation is rejected.
+    with pytest.raises(IdentityRevokedError):
+        await late_session.rotate_identity(late_request, fields={"cart"})
