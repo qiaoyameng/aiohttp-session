@@ -13,18 +13,26 @@
 Public functions
 ================
 
-.. function:: get_session(request)
+.. function:: get_session(request, *, namespace=None)
 
    A :ref:`coroutine<coroutine>` for getting session instance from
    request object.
 
+   *namespace* selects which configured session to load. The default
+   namespace (``None``) keeps the historical behavior, any other name
+   refers to a storage registered with
+   ``setup(app, storage, namespace=name)``. Each namespace is lazily
+   loaded, cached on the request and saved independently.
+
    See example below in :ref:`Session<aiohttp-session-session>`
    section for :func:`get_session` usage.
 
-.. function:: new_session(request)
+.. function:: new_session(request, *, namespace=None)
 
    A :ref:`coroutine<coroutine>` for getting a new session regardless
    of whether a cookie exists.
+
+   *namespace* has the same meaning as in :func:`get_session`.
 
    .. warning::
 
@@ -39,7 +47,7 @@ Public functions
           session = await new_session(request)
           session.new == True # This will always be True
 
-.. function:: session_middleware(storage)
+.. function:: session_middleware(storage, *, namespace=None)
 
    Session middleware factory.
 
@@ -50,15 +58,19 @@ Public functions
    session data into cookies, Redis, database etc., class is derived
    from :class:`AbstractStorage`).
 
+   *namespace* optionally binds the middleware to a non-default
+   session namespace.
+
    .. seealso:: :ref:`aiohttp-session-storage`
 
    .. note:: :func:`setup` is new-fashion way for library setup.
 
-.. function:: setup(app, storage)
+.. function:: setup(app, storage, *, namespace=None)
 
    Setup session support for given *app*.
 
-   The function is shortcut for::
+   For a single (default) namespace the function is roughly equivalent
+   to::
 
       app.middlewares.append(session_middleware(storage))
 
@@ -68,7 +80,48 @@ Public functions
    session data into cookies, Redis, database etc., class is derived
    from :class:`AbstractStorage`).
 
+   *namespace* optionally names the session, e.g.::
+
+      setup(app, RedisStorage(redis))  # default namespace, e.g. login
+      setup(app, EncryptedCookieStorage(key), namespace="prefs")
+
+   Every namespace is loaded, modified, invalidated and saved
+   independently; the request cache keys and cookie configurations are
+   fully isolated. Registration raises :exc:`ValueError` if the new
+   storage's cookie name/domain/path combination overlaps with an
+   already registered one and would overwrite its cookies, and
+   :exc:`RuntimeError` if the namespace is already in use.
+
+   A single shared middleware is installed on the first call, no
+   matter how many namespaces are registered afterwards, so no session
+   is ever saved twice.
+
+   Changed sessions are saved in registration order. Storages do not
+   provide distributed transactions: cookies are buffered and only
+   sent once every save succeeded, and if one save fails
+   :exc:`SessionSaveError` reports exactly which namespaces already
+   completed their server-side writes.
+
    .. seealso:: :ref:`aiohttp-session-storage`
+
+.. exception:: SessionSaveError
+
+   Raised when saving one of the configured session namespaces fails.
+
+   .. attribute:: saved
+
+      Namespaces whose server-side writes already completed, in save
+      order.
+
+   .. attribute:: failed
+
+      The namespace whose save raised.
+
+   .. attribute:: pending
+
+      Namespaces that were never attempted.
+
+   No session cookies are sent to the client when this is raised.
 
 
 .. _aiohttp-session-session:
