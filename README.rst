@@ -84,6 +84,17 @@ Available session storages are:
 
       $ pip install aiohttp_session[aioredis]
 
+* ``aiohttp_session.sqlite_storage.SQLiteStorage(db_path)`` -- stores JSON
+  encoded data in a SQLite database using only the Python standard library,
+  keeping a random session id in the cookie.  Expired rows are removed with
+  explicit ``await storage.cleanup_expired()`` calls; no extra service is
+  required.
+
+  The database connection is owned by a dedicated background thread, so
+  blocking sqlite3 calls never run on the event loop.  Remember to
+  ``await storage.close()`` on application shutdown (or use the storage as an
+  async context manager).
+
 
 Developing
 ----------

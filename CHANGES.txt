@@ -1,5 +1,16 @@
 .. towncrier release notes start
 
+Unreleased
+==========
+
+* Add ``aiohttp_session.sqlite_storage.SQLiteStorage``: a standard-library
+  SQLite backend that keeps only the session identity in the cookie and
+  stores the payload with an absolute expiration time. Blocking ``sqlite3``
+  calls run on a dedicated connection-owning worker thread; initialization is
+  safe for multiple workers, expired rows are removed via bounded
+  ``cleanup_expired()`` batches, and the storage is closed explicitly with
+  ``close()`` (no background tasks).
+
 2.12.1 (2024-09-25)
 ===================
 

@@ -444,3 +444,95 @@ To use the storage you need setup it first::
 
    Other parameters are the same as for
    :class:`~aiohttp_session.AbstractStorage` constructor.
+
+
+.. module:: aiohttp_session.sqlite_storage
+.. currentmodule:: aiohttp_session.sqlite_storage
+
+
+SQLite Storage
+--------------
+
+The storage that stores session data in a SQLite database and keeps only
+a random session identity in the HTTP cookie.  It uses the standard
+library :mod:`sqlite3` module, so no external service or extra
+dependency is required.
+
+Each row stores the identity, the JSON encoded session payload and an
+absolute expiration timestamp (``NULL`` means the session never
+expires).
+
+All database access happens on a single dedicated worker thread that
+owns the connection, so blocking sqlite3 calls are never executed on the
+event loop.  Because operations are serialized on that thread and the
+database is opened in WAL mode with a busy timeout, a second worker
+process sharing the same file can initialize and use the database
+concurrently.
+
+The storage is created lazily (the file, schema and worker thread come
+into existence on the first request), which means it may be constructed
+before an event loop is running.  It does **not** run any background
+task; close it on application shutdown::
+
+   storage = aiohttp_session.sqlite_storage.SQLiteStorage(
+       "/path/to/sessions.db", max_age=3600
+   )
+   aiohttp_session.setup(app, storage)
+   app.on_cleanup.append(lambda app: storage.close())
+
+It can also be used as an async context manager::
+
+   async with aiohttp_session.sqlite_storage.SQLiteStorage(path) as storage:
+       ...
+
+Expired rows are removed only on demand, in bounded batches::
+
+   removed = await storage.cleanup_expired(limit=1000)
+
+Call it repeatedly (for example from an externally scheduled job) until
+it returns fewer rows than *limit*.  A row refreshed by a concurrent
+save is never removed by a cleanup that started before the refresh.
+
+.. class:: SQLiteStorage(db_path="aiohttp_sessions.db", *, \
+                         cookie_name="AIOHTTP_SESSION", \
+                         domain=None, max_age=None, path='/', \
+                         secure=None, httponly=True, samesite=None, \
+                         key_factory=lambda: secrets.token_urlsafe(32), \
+                         encoder=json.dumps, decoder=json.loads, \
+                         timeout=5.0)
+
+   Create SQLite storage for user session data.
+
+   The class is inherited from :class:`~aiohttp_session.AbstractStorage`.
+
+   *db_path* is the database file location, or ``":memory:"`` for an
+   in-memory database.  Parent directories must exist.
+
+   *key_factory* returns new session identities; it defaults to the
+   cryptographically secure :func:`secrets.token_urlsafe`.
+
+   *timeout* is the SQLite busy timeout in seconds: statements wait that
+   long for a lock held by another process before raising
+   :class:`sqlite3.OperationalError` ("database is locked").
+
+   Other parameters are the same as for
+   :class:`~aiohttp_session.AbstractStorage` constructor.
+
+   .. note::
+
+      :meth:`save_session` sets the cookie before writing the row.  If
+      the database write fails the exception propagates to the caller
+      while the response may already carry a (not yet persisted)
+      identity.
+
+   .. method:: cleanup_expired(limit=1000)
+
+      Delete at most *limit* rows whose absolute expiration time has
+      passed.  Rows without an expiration time are kept forever.  Returns
+      the number of deleted rows.
+
+   .. method:: close()
+
+      Close the database connection and stop the worker thread.
+      Idempotent.  After it resolves, further operations raise
+      :class:`RuntimeError`.
